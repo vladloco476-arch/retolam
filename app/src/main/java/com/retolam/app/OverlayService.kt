@@ -9,6 +9,7 @@ import android.os.IBinder
 import android.view.*
 import android.widget.*
 import kotlinx.coroutines.*
+import kotlin.math.abs
 
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
@@ -118,10 +119,6 @@ class OverlayService : Service() {
             setBackgroundColor(Color.parseColor("#FF3B30"))
             textSize = 20f
         }
-        bubble.setOnClickListener {
-            panel!!.visibility =
-                if (panel!!.visibility == View.GONE) View.VISIBLE else View.GONE
-        }
 
         root.addView(panel)
         root.addView(bubble, LinearLayout.LayoutParams(dp(52), dp(52)))
@@ -138,17 +135,37 @@ class OverlayService : Service() {
         lp.y = 180
         wm.addView(root, lp)
 
-        var x0 = 0; var y0 = 0; var tx = 0; var ty = 0
+        var x0 = 0
+        var y0 = 0
+        var tx = 0
+        var ty = 0
+        var moved = false
+
         bubble.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    x0 = lp.x; y0 = lp.y
-                    tx = e.rawX.toInt(); ty = e.rawY.toInt(); true
+                    x0 = lp.x
+                    y0 = lp.y
+                    tx = e.rawX.toInt()
+                    ty = e.rawY.toInt()
+                    moved = false
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    lp.x = x0 + (e.rawX.toInt() - tx)
-                    lp.y = y0 + (e.rawY.toInt() - ty)
-                    wm.updateViewLayout(root, lp); true
+                    if (abs(e.rawX.toInt() - tx) > 15 || abs(e.rawY.toInt() - ty) > 15) {
+                        moved = true
+                        lp.x = x0 + (e.rawX.toInt() - tx)
+                        lp.y = y0 + (e.rawY.toInt() - ty)
+                        wm.updateViewLayout(root, lp)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) {
+                        panel!!.visibility =
+                            if (panel!!.visibility == View.GONE) View.VISIBLE else View.GONE
+                    }
+                    true
                 }
                 else -> false
             }
