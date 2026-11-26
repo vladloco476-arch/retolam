@@ -14,8 +14,8 @@ import android.os.HandlerThread
 import android.provider.Settings
 import android.view.View
 import android.view.accessibility.AccessibilityEvent
+import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -35,6 +35,9 @@ object Prefs {
     var esp: Boolean
         get() = p().getBoolean("esp", false)
         set(v) { p().edit().putBoolean("esp", v).apply() }
+    var fire: Boolean
+        get() = p().getBoolean("fire", false)
+        set(v) { p().edit().putBoolean("fire", v).apply() }
     var humanize: Boolean
         get() = p().getBoolean("hum", true)
         set(v) { p().edit().putBoolean("hum", v).apply() }
@@ -65,6 +68,12 @@ class Accessibility : AccessibilityService() {
         val p = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
         dispatchGesture(GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(p, 0, ms)).build(), null, null)
+    }
+
+    fun tap(x: Float, y: Float) {
+        val p = Path().apply { moveTo(x, y) }
+        dispatchGesture(GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 45)).build(), null, null)
     }
 
     companion object { var instance: Accessibility? = null }
@@ -123,53 +132,152 @@ class ScreenCapture(
 data class Box(val rect: RectF, val score: Float, val head: RectF)
 
 class Detector(ctx: Context) {
-    private val SIZE = 320
     var ready = false
     private lateinit var interp: Interpreter
+    private var inW = 320
+    private var inH = 320
+    private var nchw = false
+    private var floatIn = true
+    private lateinit var inBuf: ByteBuffer
+    private var px = IntArray(0)
+
+    private var ssd = false
+    private var yoloRows = 5
+    private var yoloAnchors = 2100
+    private var yoloOut: Array<Array<FloatArray>>? = null
+
+    private var ssdOuts: MutableMap<Int, Any> = mutableMapOf()
+    private var boxIdx = -1
+    private var catIdx = -1
+    private var scoreIdx = -1
+    private var detCount = 25
+    private var swapped = false
+    private var firstRun = true
 
     init {
         try {
             val buf = loadModel(ctx, "retolam.tflite")
-            val opts = Interpreter.Options().apply {
-                try { addDelegate(GpuDelegate()) } catch (e: Throwable) { setNumThreads(4) }
+            interp = Interpreter(buf, Interpreter.Options().apply { setNumThreads(4) })
+
+            val in = interp.getInputTensor(0)
+            val s = in.shape()
+            if (s[1] == 3) { nchw = true; inH = s[2]; inW = s[3] }
+            else { inH = s[1]; inW = s[2] }
+            floatIn = in.dataType() == DataType.FLOAT32
+            inBuf = ByteBuffer.allocateDirect(in.numBytes()).order(ByteOrder.nativeOrder())
+            px = IntArray(inW * inH)
+
+            val nOut = interp.outputTensorCount
+            if (nOut >= 3) {
+                ssd = true
+                for (i in 0 until nOut) {
+                    val o = interp.getOutputTensor(i)
+                    val os = o.shape()
+                    if (os.size == 3 && os[2] == 4) { boxIdx = i; detCount = os[1] }
+                    else if (os.size == 2 && os[1] > 1) {
+                        if (catIdx < 0) catIdx = i else if (scoreIdx < 0) scoreIdx = i
+                    }
+                    ssdOuts[i] = alloc(o.shape())
+                }
+            } else {
+                val o = interp.getOutputTensor(0).shape()
+                yoloRows = o[1]
+                yoloAnchors = o[2]
+                yoloOut = Array(1) { Array(yoloRows) { FloatArray(yoloAnchors) } }
             }
-            interp = Interpreter(buf, opts)
-            ready = true
+            ready = boxIdx >= 0 || yoloOut != null
         } catch (e: Throwable) { ready = false }
     }
 
-    fun detect(bmp: Bitmap, thr: Float = 0.40f): List<Box> {
-        if (!ready) return emptyList()
-        val scaled = Bitmap.createScaledBitmap(bmp, SIZE, SIZE, true)
-        val inBuf = ByteBuffer.allocateDirect(4 * SIZE * SIZE * 3)
-            .order(ByteOrder.nativeOrder())
-        val px = IntArray(SIZE * SIZE)
-        scaled.getPixels(px, 0, SIZE, 0, 0, SIZE, SIZE)
-        for (v in px) {
-            inBuf.putFloat((v shr 16 and 0xFF) / 255f)
-            inBuf.putFloat((v shr 8 and 0xFF) / 255f)
-            inBuf.putFloat((v and 0xFF) / 255f)
-        }
-        inBuf.rewind()
-        val out = Array(1) { Array(5) { FloatArray(2100) } }
-        interp.run(inBuf, out)
+    private fun alloc(shape: IntArray): Any {
+        if (shape.size <= 1) return FloatArray(if (shape.isEmpty()) 1 else shape[0])
+        return Array(shape[0]) { alloc(shape.copyOfRange(1, shape.size)) }
+    }
 
-        val sx = bmp.width / SIZE.toFloat()
-        val sy = bmp.height / SIZE.toFloat()
+    fun detect(bmp: Bitmap, thr: Float = 0.35f): List<Box> {
+        if (!ready) return emptyList()
+        try {
+            val scaled = Bitmap.createScaledBitmap(bmp, inW, inH, true)
+            scaled.getPixels(px, 0, inW, 0, 0, inW, inH)
+            inBuf.rewind()
+            if (floatIn) {
+                if (nchw) for (c in 0..2) for (v in px)
+                    inBuf.putFloat((v shr (16 - c * 8) and 0xFF) / 255f)
+                else for (v in px) {
+                    inBuf.putFloat((v shr 16 and 0xFF) / 255f)
+                    inBuf.putFloat((v shr 8 and 0xFF) / 255f)
+                    inBuf.putFloat((v and 0xFF) / 255f)
+                }
+            } else {
+                if (nchw) for (c in 0..2) for (v in px)
+                    inBuf.put((v shr (16 - c * 8) and 0xFF).toByte())
+                else for (v in px) {
+                    inBuf.put((v shr 16 and 0xFF).toByte())
+                    inBuf.put((v shr 8 and 0xFF).toByte())
+                    inBuf.put((v and 0xFF).toByte())
+                }
+            }
+            inBuf.rewind()
+
+            if (ssd) return detectSsd(bmp, thr)
+            return detectYolo(bmp, thr)
+        } catch (e: Throwable) { return emptyList() }
+    }
+
+    private fun detectSsd(bmp: Bitmap, thr: Float): List<Box> {
+        interp.run(inBuf, ssdOuts)
+        @Suppress("UNCHECKED_CAST")
+        val boxes = ssdOuts[boxIdx] as Array<Array<FloatArray>>
+        @Suppress("UNCHECKED_CAST")
+        var cats = ssdOuts[catIdx] as Array<FloatArray>
+        @Suppress("UNCHECKED_CAST")
+        var scores = ssdOuts[scoreIdx] as Array<FloatArray>
+
+        if (firstRun) {
+            firstRun = false
+            if (scores[0][0] > 1.5f) { val t = cats; cats = scores; scores = t; swapped = true }
+        }
+
         val res = mutableListOf<Box>()
-        for (i in 0 until 2100) {
-            val conf = out[0][4][i]
+        val n = minOf(detCount, boxes[0].size, scores[0].size)
+        for (i in 0 until n) {
+            val sc = scores[0][i]
+            if (sc < thr) continue
+            if (cats[0][i].toInt() != 0) continue
+            val y1 = boxes[0][i][0] * bmp.height
+            val x1 = boxes[0][i][1] * bmp.width
+            val y2 = boxes[0][i][2] * bmp.height
+            val x2 = boxes[0][i][3] * bmp.width
+            res.add(makeBox(x1, y1, x2, y2, sc))
+        }
+        return nms(res)
+    }
+
+    private fun detectYolo(bmp: Bitmap, thr: Float): List<Box> {
+        interp.run(inBuf, yoloOut)
+        val out = yoloOut ?: return emptyList()
+        val sx = bmp.width / inW.toFloat()
+        val sy = bmp.height / inH.toFloat()
+        val res = mutableListOf<Box>()
+        for (i in 0 until yoloAnchors) {
+            var conf = 0f
+            for (r in 4 until yoloRows) if (out[0][r][i] > conf) conf = out[0][r][i]
             if (conf < thr) continue
             val cx = out[0][0][i] * sx
             val cy = out[0][1][i] * sy
             val bw = out[0][2][i] * sx
             val bh = out[0][3][i] * sy
-            val body = RectF(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2)
-            val head = RectF(body.left + bw * 0.22f, body.top,
-                body.right - bw * 0.22f, body.top + bh * 0.22f)
-            res.add(Box(body, conf, head))
+            res.add(makeBox(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, conf))
         }
         return nms(res)
+    }
+
+    private fun makeBox(x1: Float, y1: Float, x2: Float, y2: Float, sc: Float): Box {
+        val body = RectF(x1, y1, x2, y2)
+        val hw = body.width() * 0.28f
+        val head = RectF(body.left + hw, body.top, body.right - hw,
+            body.top + body.height() * 0.22f)
+        return Box(body, sc, head)
     }
 
     private fun nms(boxes: List<Box>): List<Box> {
@@ -180,7 +288,7 @@ class Detector(ctx: Context) {
             keep.add(b)
             sorted.removeAll { iou(b.rect, it.rect) > 0.45f }
         }
-        return keep
+        return keep.take(8)
     }
 
     private fun iou(a: RectF, b: RectF): Float {
@@ -200,40 +308,21 @@ class Detector(ctx: Context) {
 }
 
 class AimEngine {
-    private var nextAllowed = 0L
     private val rnd = Random(System.nanoTime())
+    var lastFire = 0L
 
-    fun shouldFire(target: RectF, sw: Int, sh: Int, lvl: Int): Boolean {
+    fun jitter(lvl: Int): Float = if (lvl <= 1) 0f
+        else (rnd.nextFloat() * 2f - 1f) * (lvl - 1) * 2.5f
+
+    fun dragMs(step: Float, lvl: Int): Long =
+        ((step * 0.35f).toLong() + rnd.nextLong(10, 25) * lvl).coerceIn(24L, 180L)
+
+    fun canFire(lvl: Int): Boolean {
         val now = System.currentTimeMillis()
-        if (now < nextAllowed) return false
-        if (hypot(abs(sw / 2f - target.centerX()),
-                abs(sh * 0.45f - target.centerY())) < 12f * lvl) return false
-        val react = when (lvl) {
-            1 -> rnd.nextLong(20, 55)
-            2 -> rnd.nextLong(45, 110)
-            3 -> rnd.nextLong(90, 190)
-            4 -> rnd.nextLong(150, 300)
-            else -> rnd.nextLong(230, 430)
-        }
-        nextAllowed = now + react
+        if (now - lastFire < 90L + lvl * 35L) return false
+        lastFire = now
         return true
     }
-
-    fun path(fromX: Float, fromY: Float, t: RectF, lvl: Int): Pair<Float, Float> {
-        val err = (lvl - 1) * 2.2f
-        val jx = rnd.nextFloat() * err * 2 - err
-        val jy = rnd.nextFloat() * err * 2 - err
-        val over = if (rnd.nextFloat() < 0.35f) rnd.nextFloat() * 6f * lvl else 0f
-        val tx = t.centerX() + jx + if (fromX < t.centerX()) over else -over
-        return tx to (t.centerY() + jy)
-    }
-
-    fun dragMs(dist: Float, lvl: Int): Long {
-        val base = (dist * 0.55f).toLong()
-        return (base + rnd.nextLong(8, 30) * lvl).coerceIn(28L, 340L)
-    }
-
-    fun reset() { nextAllowed = 0L }
 }
 
 class EspRenderer(ctx: Context) : View(ctx) {
@@ -253,7 +342,8 @@ class EspRenderer(ctx: Context) : View(ctx) {
             body.color = if (b.score > 0.65f) Color.parseColor("#39FF14")
                          else Color.parseColor("#FFD60A")
             c.drawRect(b.rect, body)
-            c.drawRect(b.head, headP)
+            c.drawCircle(b.head.centerX(), b.head.centerY(),
+                maxOf(b.head.width() * 0.75f, 10f), headP)
             c.drawLine(cx, cy, b.rect.centerX(), b.rect.centerY(), lineP)
         }
     }
