@@ -14,7 +14,6 @@ import android.os.HandlerThread
 import android.provider.Settings
 import android.view.View
 import android.view.accessibility.AccessibilityEvent
-import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -133,153 +132,82 @@ data class Box(val rect: RectF, val score: Float, val head: RectF)
 
 class Detector(ctx: Context) {
     var ready = false
-    private lateinit var interp: Interpreter
-    private var inW = 320
-    private var inH = 320
-    private var nchw = false
-    private var floatIn = true
-    private lateinit var inBuf: ByteBuffer
-    private var px = IntArray(0)
+    private var interp: Interpreter? = null
 
-    private var ssd = false
-    private var yoloRows = 5
-    private var yoloAnchors = 2100
-    private var yoloOut: Array<Array<FloatArray>>? = null
-
-    private var ssdOuts: MutableMap<Int, Any> = mutableMapOf()
-    private var boxIdx = -1
-    private var catIdx = -1
-    private var scoreIdx = -1
-    private var detCount = 25
+    private val N = 25
+    private val SZ = 320
+    private val inBuf: ByteBuffer
+    private val px = IntArray(SZ * SZ)
+    private val oBox = Array(1) { Array(N) { FloatArray(4) } }
+    private val oCat = Array(1) { FloatArray(N) }
+    private val oScore = Array(1) { FloatArray(N) }
+    private val oCnt = Array(1) { FloatArray(1) }
+    private val outs = mutableMapOf<Int, Any>()
     private var firstRun = true
+    private var swap = false
 
     init {
+        inBuf = ByteBuffer.allocateDirect(4 * SZ * SZ * 3).order(ByteOrder.nativeOrder())
+        outs[0] = oBox
+        outs[1] = oCat
+        outs[2] = oScore
+        outs[3] = oCnt
         try {
-            val buf = loadModel(ctx, "retolam.tflite")
-            interp = Interpreter(buf, Interpreter.Options().apply { setNumThreads(4) })
-
-            val inp = interp.getInputTensor(0)
-            val s = inp.shape()
-            if (s[1] == 3) { nchw = true; inH = s[2]; inW = s[3] }
-            else { inH = s[1]; inW = s[2] }
-            floatIn = inp.dataType() == DataType.FLOAT32
-            inBuf = ByteBuffer.allocateDirect(inp.numBytes()).order(ByteOrder.nativeOrder())
-            px = IntArray(inW * inH)
-
-            val nOut = interp.outputTensorCount
-            if (nOut >= 3) {
-                ssd = true
-                for (i in 0 until nOut) {
-                    val o = interp.getOutputTensor(i)
-                    val os = o.shape()
-                    if (os.size == 3 && os[2] == 4) { boxIdx = i; detCount = os[1] }
-                    else if (os.size == 2 && os[1] > 1) {
-                        if (catIdx < 0) catIdx = i else if (scoreIdx < 0) scoreIdx = i
-                    }
-                    ssdOuts[i] = alloc(os)
-                }
-            } else {
-                val o = interp.getOutputTensor(0).shape()
-                yoloRows = o[1]
-                yoloAnchors = o[2]
-                yoloOut = Array(1) { Array(yoloRows) { FloatArray(yoloAnchors) } }
-            }
-            ready = if (ssd) boxIdx >= 0 && catIdx >= 0 && scoreIdx >= 0
-                    else yoloOut != null
+            val fd = ctx.assets.openFd("retolam.tflite")
+            val m = FileInputStream(fd.fileDescriptor).channel
+                .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+            interp = Interpreter(m, Interpreter.Options().apply { setNumThreads(4) })
+            ready = true
         } catch (e: Throwable) { ready = false }
     }
 
-    private fun alloc(shape: IntArray): Any {
-        if (shape.size <= 1) return FloatArray(if (shape.isEmpty()) 1 else shape[0])
-        return Array(shape[0]) { alloc(shape.copyOfRange(1, shape.size)) }
-    }
-
     fun detect(bmp: Bitmap, thr: Float = 0.35f): List<Box> {
+        val tf = interp ?: return emptyList()
         if (!ready) return emptyList()
         try {
-            val scaled = Bitmap.createScaledBitmap(bmp, inW, inH, true)
-            scaled.getPixels(px, 0, inW, 0, 0, inW, inH)
+            val sc = Bitmap.createScaledBitmap(bmp, SZ, SZ, true)
+            sc.getPixels(px, 0, SZ, 0, 0, SZ, SZ)
             inBuf.rewind()
-            if (floatIn) {
-                if (nchw) {
-                    for (c in 0..2) for (v in px)
-                        inBuf.putFloat((v shr (16 - c * 8) and 0xFF) / 255f)
-                } else {
-                    for (v in px) {
-                        inBuf.putFloat((v shr 16 and 0xFF) / 255f)
-                        inBuf.putFloat((v shr 8 and 0xFF) / 255f)
-                        inBuf.putFloat((v and 0xFF) / 255f)
-                    }
-                }
-            } else {
-                if (nchw) {
-                    for (c in 0..2) for (v in px)
-                        inBuf.put((v shr (16 - c * 8) and 0xFF).toByte())
-                } else {
-                    for (v in px) {
-                        inBuf.put((v shr 16 and 0xFF).toByte())
-                        inBuf.put((v shr 8 and 0xFF).toByte())
-                        inBuf.put((v and 0xFF).toByte())
-                    }
-                }
+            for (v in px) {
+                inBuf.putFloat((v shr 16 and 0xFF) / 255f)
+                inBuf.putFloat((v shr 8 and 0xFF) / 255f)
+                inBuf.putFloat((v and 0xFF) / 255f)
             }
             inBuf.rewind()
+            tf.run(inBuf, outs)
 
-            if (ssd) return detectSsd(bmp, thr)
-            return detectYolo(bmp, thr)
+            if (firstRun) {
+                firstRun = false
+                if (oScore[0][0] > 1.5f) swap = true
+            }
+            val scArr = if (swap) oCat else oScore
+            val clArr = if (swap) oScore else oCat
+
+            var n = oCnt[0][0].toInt()
+            if (n < 1 || n > N) n = N
+
+            var maxC = 0f
+            for (i in 0 until n) {
+                for (k in 0..3) if (oBox[0][i][k] > maxC) maxC = oBox[0][i][k]
+            }
+            val isPx = maxC > 1.5f
+            val kx = if (isPx) bmp.width / SZ.toFloat() else bmp.width.toFloat()
+            val ky = if (isPx) bmp.height / SZ.toFloat() else bmp.height.toFloat()
+
+            val res = mutableListOf<Box>()
+            for (i in 0 until n) {
+                val s = scArr[0][i]
+                if (s < thr) continue
+                if (clArr[0][i].toInt() != 0) continue
+                val x1 = oBox[0][i][1] * kx
+                val y1 = oBox[0][i][0] * ky
+                val x2 = oBox[0][i][3] * kx
+                val y2 = oBox[0][i][2] * ky
+                if (x2 - x1 < 8f || y2 - y1 < 16f) continue
+                res.add(makeBox(x1, y1, x2, y2, s))
+            }
+            return nms(res)
         } catch (e: Throwable) { return emptyList() }
-    }
-
-    private fun detectSsd(bmp: Bitmap, thr: Float): List<Box> {
-        interp.run(inBuf, ssdOuts as Map<Int, Any>)
-        @Suppress("UNCHECKED_CAST")
-        val boxes = ssdOuts[boxIdx] as Array<Array<FloatArray>>
-        @Suppress("UNCHECKED_CAST")
-        var cats = ssdOuts[catIdx] as Array<FloatArray>
-        @Suppress("UNCHECKED_CAST")
-        var scores = ssdOuts[scoreIdx] as Array<FloatArray>
-
-        if (firstRun) {
-            firstRun = false
-            if (scores[0][0] > 1.5f) {
-                val t = cats
-                cats = scores
-                scores = t
-            }
-        }
-
-        val res = mutableListOf<Box>()
-        val n = minOf(detCount, boxes[0].size, scores[0].size)
-        for (i in 0 until n) {
-            val sc = scores[0][i]
-            if (sc < thr) continue
-            if (cats[0][i].toInt() != 0) continue
-            res.add(makeBox(
-                boxes[0][i][1] * bmp.width,
-                boxes[0][i][0] * bmp.height,
-                boxes[0][i][3] * bmp.width,
-                boxes[0][i][2] * bmp.height, sc))
-        }
-        return nms(res)
-    }
-
-    private fun detectYolo(bmp: Bitmap, thr: Float): List<Box> {
-        val out = yoloOut ?: return emptyList()
-        interp.run(inBuf, out)
-        val sx = bmp.width / inW.toFloat()
-        val sy = bmp.height / inH.toFloat()
-        val res = mutableListOf<Box>()
-        for (i in 0 until yoloAnchors) {
-            var conf = 0f
-            for (r in 4 until yoloRows) if (out[0][r][i] > conf) conf = out[0][r][i]
-            if (conf < thr) continue
-            val cx = out[0][0][i] * sx
-            val cy = out[0][1][i] * sy
-            val bw = out[0][2][i] * sx
-            val bh = out[0][3][i] * sy
-            res.add(makeBox(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, conf))
-        }
-        return nms(res)
     }
 
     private fun makeBox(x1: Float, y1: Float, x2: Float, y2: Float, sc: Float): Box {
@@ -308,13 +236,7 @@ class Detector(ctx: Context) {
         return i / (a.width() * a.height() + b.width() * b.height() - i)
     }
 
-    private fun loadModel(ctx: Context, name: String): ByteBuffer {
-        val fd = ctx.assets.openFd(name)
-        return FileInputStream(fd.fileDescriptor).channel
-            .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-    }
-
-    fun close() { if (ready) interp.close() }
+    fun close() { interp?.close() }
 }
 
 class AimEngine {
@@ -343,6 +265,8 @@ class EspRenderer(ctx: Context) : View(ctx) {
         style = Paint.Style.STROKE; strokeWidth = 2.5f; color = Color.parseColor("#FF3B30") }
     private val lineP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; strokeWidth = 2f; color = Color.parseColor("#00E5FF") }
+    private val dbg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#39FF14"); textSize = 30f }
 
     override fun onDraw(c: Canvas) {
         super.onDraw(c)
@@ -356,6 +280,8 @@ class EspRenderer(ctx: Context) : View(ctx) {
                 maxOf(b.head.width() * 0.75f, 10f), headP)
             c.drawLine(cx, cy, b.rect.centerX(), b.rect.centerY(), lineP)
         }
+        val top = boxes.maxOfOrNull { it.score }
+        c.drawText("det:${boxes.size} " + (top?.toString() ?: "-"), 24f, 46f, dbg)
     }
 }
 
