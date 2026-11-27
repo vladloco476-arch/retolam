@@ -151,7 +151,6 @@ class Detector(ctx: Context) {
     private var catIdx = -1
     private var scoreIdx = -1
     private var detCount = 25
-    private var swapped = false
     private var firstRun = true
 
     init {
@@ -159,12 +158,12 @@ class Detector(ctx: Context) {
             val buf = loadModel(ctx, "retolam.tflite")
             interp = Interpreter(buf, Interpreter.Options().apply { setNumThreads(4) })
 
-            val in = interp.getInputTensor(0)
-            val s = in.shape()
+            val inp = interp.getInputTensor(0)
+            val s = inp.shape()
             if (s[1] == 3) { nchw = true; inH = s[2]; inW = s[3] }
             else { inH = s[1]; inW = s[2] }
-            floatIn = in.dataType() == DataType.FLOAT32
-            inBuf = ByteBuffer.allocateDirect(in.numBytes()).order(ByteOrder.nativeOrder())
+            floatIn = inp.dataType() == DataType.FLOAT32
+            inBuf = ByteBuffer.allocateDirect(inp.numBytes()).order(ByteOrder.nativeOrder())
             px = IntArray(inW * inH)
 
             val nOut = interp.outputTensorCount
@@ -177,7 +176,7 @@ class Detector(ctx: Context) {
                     else if (os.size == 2 && os[1] > 1) {
                         if (catIdx < 0) catIdx = i else if (scoreIdx < 0) scoreIdx = i
                     }
-                    ssdOuts[i] = alloc(o.shape())
+                    ssdOuts[i] = alloc(os)
                 }
             } else {
                 val o = interp.getOutputTensor(0).shape()
@@ -185,7 +184,8 @@ class Detector(ctx: Context) {
                 yoloAnchors = o[2]
                 yoloOut = Array(1) { Array(yoloRows) { FloatArray(yoloAnchors) } }
             }
-            ready = boxIdx >= 0 || yoloOut != null
+            ready = if (ssd) boxIdx >= 0 && catIdx >= 0 && scoreIdx >= 0
+                    else yoloOut != null
         } catch (e: Throwable) { ready = false }
     }
 
@@ -201,20 +201,26 @@ class Detector(ctx: Context) {
             scaled.getPixels(px, 0, inW, 0, 0, inW, inH)
             inBuf.rewind()
             if (floatIn) {
-                if (nchw) for (c in 0..2) for (v in px)
-                    inBuf.putFloat((v shr (16 - c * 8) and 0xFF) / 255f)
-                else for (v in px) {
-                    inBuf.putFloat((v shr 16 and 0xFF) / 255f)
-                    inBuf.putFloat((v shr 8 and 0xFF) / 255f)
-                    inBuf.putFloat((v and 0xFF) / 255f)
+                if (nchw) {
+                    for (c in 0..2) for (v in px)
+                        inBuf.putFloat((v shr (16 - c * 8) and 0xFF) / 255f)
+                } else {
+                    for (v in px) {
+                        inBuf.putFloat((v shr 16 and 0xFF) / 255f)
+                        inBuf.putFloat((v shr 8 and 0xFF) / 255f)
+                        inBuf.putFloat((v and 0xFF) / 255f)
+                    }
                 }
             } else {
-                if (nchw) for (c in 0..2) for (v in px)
-                    inBuf.put((v shr (16 - c * 8) and 0xFF).toByte())
-                else for (v in px) {
-                    inBuf.put((v shr 16 and 0xFF).toByte())
-                    inBuf.put((v shr 8 and 0xFF).toByte())
-                    inBuf.put((v and 0xFF).toByte())
+                if (nchw) {
+                    for (c in 0..2) for (v in px)
+                        inBuf.put((v shr (16 - c * 8) and 0xFF).toByte())
+                } else {
+                    for (v in px) {
+                        inBuf.put((v shr 16 and 0xFF).toByte())
+                        inBuf.put((v shr 8 and 0xFF).toByte())
+                        inBuf.put((v and 0xFF).toByte())
+                    }
                 }
             }
             inBuf.rewind()
@@ -225,7 +231,7 @@ class Detector(ctx: Context) {
     }
 
     private fun detectSsd(bmp: Bitmap, thr: Float): List<Box> {
-        interp.run(inBuf, ssdOuts)
+        interp.run(inBuf, ssdOuts as Map<Int, Any>)
         @Suppress("UNCHECKED_CAST")
         val boxes = ssdOuts[boxIdx] as Array<Array<FloatArray>>
         @Suppress("UNCHECKED_CAST")
@@ -235,7 +241,11 @@ class Detector(ctx: Context) {
 
         if (firstRun) {
             firstRun = false
-            if (scores[0][0] > 1.5f) { val t = cats; cats = scores; scores = t; swapped = true }
+            if (scores[0][0] > 1.5f) {
+                val t = cats
+                cats = scores
+                scores = t
+            }
         }
 
         val res = mutableListOf<Box>()
@@ -244,18 +254,18 @@ class Detector(ctx: Context) {
             val sc = scores[0][i]
             if (sc < thr) continue
             if (cats[0][i].toInt() != 0) continue
-            val y1 = boxes[0][i][0] * bmp.height
-            val x1 = boxes[0][i][1] * bmp.width
-            val y2 = boxes[0][i][2] * bmp.height
-            val x2 = boxes[0][i][3] * bmp.width
-            res.add(makeBox(x1, y1, x2, y2, sc))
+            res.add(makeBox(
+                boxes[0][i][1] * bmp.width,
+                boxes[0][i][0] * bmp.height,
+                boxes[0][i][3] * bmp.width,
+                boxes[0][i][2] * bmp.height, sc))
         }
         return nms(res)
     }
 
     private fun detectYolo(bmp: Bitmap, thr: Float): List<Box> {
-        interp.run(inBuf, yoloOut)
         val out = yoloOut ?: return emptyList()
+        interp.run(inBuf, out)
         val sx = bmp.width / inW.toFloat()
         val sy = bmp.height / inH.toFloat()
         val res = mutableListOf<Box>()
