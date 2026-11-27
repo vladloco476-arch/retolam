@@ -10,6 +10,11 @@ import android.view.*
 import android.widget.*
 import kotlinx.coroutines.*
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.min
+import kotlin.math.sin
 
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
@@ -85,14 +90,15 @@ class OverlayService : Service() {
                 setOnCheckedChangeListener { _, v -> set(v) }
             })
         }
-        sw("Aimbot", { Prefs.aimbot }, { Prefs.aimbot = it; aim.reset() })
-        sw("ESP", { Prefs.esp }, { Prefs.esp = it
+        sw("Aimbot (cabeza)", { Prefs.aimbot }, { Prefs.aimbot = it })
+        sw("ESP (lineas)", { Prefs.esp }, { Prefs.esp = it
             if (!it) { draw?.boxes = emptyList(); draw?.invalidate() } })
+        sw("Disparar", { Prefs.fire }, { Prefs.fire = it })
         sw("Humanizar", { Prefs.humanize }, { Prefs.humanize = it })
 
         val lbl = TextView(this).apply {
             setTextColor(Color.parseColor("#8A94A6"))
-            text = "Humanización: ${Prefs.level}"
+            text = "Humanizacion: ${Prefs.level}"
         }
         panel!!.addView(lbl)
         panel!!.addView(SeekBar(this).apply {
@@ -101,7 +107,7 @@ class OverlayService : Service() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
                     Prefs.level = p + 1
-                    lbl.text = "Humanización: ${p + 1}"
+                    lbl.text = "Humanizacion: ${p + 1}"
                 }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -187,19 +193,38 @@ class OverlayService : Service() {
                     }
                     if (Prefs.aimbot) doAim(found, bmp.width, bmp.height)
                 }
-                delay(if (Prefs.aimbot) 16 else 40)
+                delay(if (Prefs.aimbot) 55 else 40)
             }
         }
     }
 
     private suspend fun doAim(boxes: List<Box>, w: Int, h: Int) {
         val a = Accessibility.instance ?: return
-        val t = boxes.minByOrNull { kotlin.math.abs(it.rect.centerX() - w / 2f) } ?: return
+        val cx = w / 2f
+        val cy = h * 0.45f
+        val fov = w * 0.35f
+
+        val t = boxes
+            .filter { hypot(it.head.centerX() - cx, it.head.centerY() - cy) < fov }
+            .minByOrNull { hypot(it.head.centerX() - cx, it.head.centerY() - cy) }
+            ?: return
+
         val lvl = if (Prefs.humanize) Prefs.level else 1
-        if (!aim.shouldFire(t.head, w, h, lvl)) return
-        val (tx, ty) = aim.path(w / 2f, h * 0.45f, t.head, lvl)
-        val ms = aim.dragMs(kotlin.math.hypot(tx - w / 2f, ty - h * 0.45f), lvl)
-        withContext(Dispatchers.Main) { a.swipe(w / 2f, h * 0.45f, tx, ty, ms) }
+        val dx = t.head.centerX() + aim.jitter(lvl) - cx
+        val dy = t.head.centerY() + aim.jitter(lvl) - cy
+        val dist = hypot(dx, dy)
+
+        if (dist < 6f) {
+            if (Prefs.fire && aim.canFire(lvl)) withContext(Dispatchers.Main) {
+                a.tap(w * 0.88f, h * 0.82f)
+            }
+            return
+        }
+        val step = min(dist, 200f) * 0.5f
+        val ang = atan2(dy, dx)
+        val tx = cx + cos(ang) * step
+        val ty = cy + sin(ang) * step
+        withContext(Dispatchers.Main) { a.swipe(cx, cy, tx, ty, aim.dragMs(step, lvl)) }
     }
 
     private fun notif() {
